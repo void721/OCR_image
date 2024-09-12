@@ -18,7 +18,7 @@ from abc import ABC, abstractmethod
 import torch
 import torch.nn as nn
 
-from .multimodal_encoder.builder import build_vision_tower
+from .multimodal_encoder.builder import build_vision_tower_llavaprumerge, build_vision_tower_org
 from .multimodal_projector.builder import build_vision_projector
 
 from llava.constants import IGNORE_INDEX, IMAGE_TOKEN_INDEX, DEFAULT_IMAGE_PATCH_TOKEN, DEFAULT_IM_START_TOKEN, DEFAULT_IM_END_TOKEN
@@ -26,13 +26,13 @@ from llava.constants import IGNORE_INDEX, IMAGE_TOKEN_INDEX, DEFAULT_IMAGE_PATCH
 from llava.mm_utils import get_anyres_image_grid_shape
 
 
-class LlavaMetaModel:
+class LlavaMetaModel_llavaprumerge:
 
     def __init__(self, config):
-        super(LlavaMetaModel, self).__init__(config)
+        super(LlavaMetaModel_llavaprumerge, self).__init__(config)
 
         if hasattr(config, "mm_vision_tower"):
-            self.vision_tower = build_vision_tower(config, delay_load=True)
+            self.vision_tower = build_vision_tower_llavaprumerge(config, delay_load=True)
             self.mm_projector = build_vision_projector(config)
 
             if 'unpad' in getattr(config, 'mm_patch_merge_type', ''):
@@ -56,7 +56,78 @@ class LlavaMetaModel:
         self.config.mm_vision_tower = vision_tower
 
         if self.get_vision_tower() is None:
-            vision_tower = build_vision_tower(model_args)
+            vision_tower = build_vision_tower_llavaprumerge(model_args)
+
+            if fsdp is not None and len(fsdp) > 0:
+                self.vision_tower = [vision_tower]
+            else:
+                self.vision_tower = vision_tower
+        else:
+            if fsdp is not None and len(fsdp) > 0:
+                vision_tower = self.vision_tower[0]
+            else:
+                vision_tower = self.vision_tower
+            vision_tower.load_model()
+
+        self.config.use_mm_proj = True
+        self.config.mm_projector_type = getattr(model_args, 'mm_projector_type', 'linear')
+        self.config.mm_hidden_size = vision_tower.hidden_size
+        self.config.mm_vision_select_layer = mm_vision_select_layer
+        self.config.mm_vision_select_feature = mm_vision_select_feature
+        self.config.mm_patch_merge_type = mm_patch_merge_type
+
+        if getattr(self, 'mm_projector', None) is None:
+            self.mm_projector = build_vision_projector(self.config)
+
+            if 'unpad' in mm_patch_merge_type:
+                embed_std = 1 / torch.sqrt(torch.tensor(self.config.hidden_size, dtype=self.dtype))
+                self.image_newline = nn.Parameter(
+                    torch.randn(self.config.hidden_size, dtype=self.dtype) * embed_std
+                )
+        else:
+            # In case it is frozen by LoRA
+            for p in self.mm_projector.parameters():
+                p.requires_grad = True
+
+        if pretrain_mm_mlp_adapter is not None:
+            mm_projector_weights = torch.load(pretrain_mm_mlp_adapter, map_location='cpu')
+            def get_w(weights, keyword):
+                return {k.split(keyword + '.')[1]: v for k, v in weights.items() if keyword in k}
+
+            self.mm_projector.load_state_dict(get_w(mm_projector_weights, 'mm_projector'))
+
+
+class LlavaMetaModel_org:
+
+    def __init__(self, config):
+        super(LlavaMetaModel_org, self).__init__(config)
+
+        if hasattr(config, "mm_vision_tower"):
+            self.vision_tower = build_vision_tower_org(config, delay_load=True)
+            self.mm_projector = build_vision_projector(config)
+
+            if 'unpad' in getattr(config, 'mm_patch_merge_type', ''):
+                self.image_newline = nn.Parameter(
+                    torch.empty(config.hidden_size, dtype=self.dtype)
+                )
+
+    def get_vision_tower(self):
+        vision_tower = getattr(self, 'vision_tower', None)
+        if type(vision_tower) is list:
+            vision_tower = vision_tower[0]
+        return vision_tower
+
+    def initialize_vision_modules(self, model_args, fsdp=None):
+        vision_tower = model_args.vision_tower
+        mm_vision_select_layer = model_args.mm_vision_select_layer
+        mm_vision_select_feature = model_args.mm_vision_select_feature
+        pretrain_mm_mlp_adapter = model_args.pretrain_mm_mlp_adapter
+        mm_patch_merge_type = model_args.mm_patch_merge_type
+
+        self.config.mm_vision_tower = vision_tower
+
+        if self.get_vision_tower() is None:
+            vision_tower = build_vision_tower_org(model_args)
 
             if fsdp is not None and len(fsdp) > 0:
                 self.vision_tower = [vision_tower]
@@ -146,12 +217,13 @@ class LlavaMetaForCausalLM(ABC):
         self, input_ids, position_ids, attention_mask, past_key_values, labels,
         images, image_sizes=None
     ):
-        import pdb
-        pdb.set_trace()
+        # import pdb
+        # pdb.set_trace()
         
         # images.shape -> torch.Size([1, 5, 3, 336, 336])
         # input_ids.shape -> torch.Size([1, 46]) 有图像的
         # input_ids.shape -> torch.Size([1, 41]) 没有图像的
+        # print("print ")
         
         vision_tower = self.get_vision_tower()
         
@@ -225,7 +297,7 @@ class LlavaMetaForCausalLM(ABC):
                 # 2144
                 # (Pdb) len(image_features[0][0])
                 # 4096
-                print(f"image feature number: {len(image_features[0])}")
+                print(f"**image feature number:** {len(image_features[0])}")
             else:
                 raise ValueError(f"Unexpected mm_patch_merge_type: {self.config.mm_patch_merge_type}")
         else:
